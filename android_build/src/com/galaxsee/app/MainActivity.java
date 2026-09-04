@@ -81,7 +81,9 @@ public class MainActivity extends Activity {
         settings.setUseWideViewPort(true);
 
         // Register Native JavaScript Bridge
-        webView.addJavascriptInterface(new NativeBridge(), "GalaxseeAndroid");
+        NativeBridge nativeBridge = new NativeBridge();
+        webView.addJavascriptInterface(nativeBridge, "GalaxseeAndroid");
+        webView.addJavascriptInterface(nativeBridge, "AndroidBridge");
 
         webView.setWebViewClient(new WebViewClient() {
             @Override
@@ -304,6 +306,16 @@ public class MainActivity extends Activity {
                 }
             });
         }
+
+        @JavascriptInterface
+        public void pickFolder() {
+            openFolderPicker();
+        }
+
+        @JavascriptInterface
+        public void openFolder() {
+            openFolderPicker();
+        }
     }
 
     private String scanMediaStorePhotos() {
@@ -413,67 +425,8 @@ public class MainActivity extends Activity {
                 SimpleDateFormat isoFormat = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US);
                 isoFormat.setTimeZone(TimeZone.getTimeZone("UTC"));
 
-                Uri childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(
-                    treeUri,
-                    DocumentsContract.getTreeDocumentId(treeUri)
-                );
-
-                String[] projection = new String[]{
-                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-                    DocumentsContract.Document.COLUMN_MIME_TYPE,
-                    DocumentsContract.Document.COLUMN_SIZE,
-                    DocumentsContract.Document.COLUMN_LAST_MODIFIED
-                };
-
-                try (Cursor cursor = getContentResolver().query(childrenUri, projection, null, null, null)) {
-                    if (cursor != null && cursor.moveToFirst()) {
-                        int idCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID);
-                        int nameCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME);
-                        int mimeCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE);
-                        int sizeCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_SIZE);
-                        int modCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_LAST_MODIFIED);
-
-                        do {
-                            String docId = cursor.getString(idCol);
-                            String name = cursor.getString(nameCol);
-                            String mime = cursor.getString(mimeCol);
-                            long size = cursor.getLong(sizeCol);
-                            long mod = cursor.getLong(modCol);
-
-                            if (mime != null && (mime.startsWith("image/") || mime.startsWith("video/"))) {
-                                Uri docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId);
-                                String encoded = Uri.encode(docUri.toString());
-                                boolean isVideo = mime.startsWith("video/");
-                                String dateIso = isoFormat.format(new Date(mod > 0 ? mod : System.currentTimeMillis()));
-
-                                JSONObject photo = new JSONObject();
-                                photo.put("id", "tree-doc-" + Math.abs(docId.hashCode()));
-                                photo.put("title", name != null ? name.replaceFirst("[.][^.]+$", "") : "Imported File");
-                                photo.put("description", name + " (" + (size / 1024) + " KB)");
-                                photo.put("url", "https://" + MEDIA_HOST + "/image/doc_" + encoded);
-                                photo.put("thumbnailUrl", "https://" + MEDIA_HOST + "/thumbnail/doc_" + encoded);
-                                photo.put("width", 1920);
-                                photo.put("height", 1080);
-                                photo.put("aspectRatio", 1.77);
-                                photo.put("date", dateIso);
-                                photo.put("category", isVideo ? "Videos" : "Imported Folder");
-                                photo.put("fileType", mime);
-                                photo.put("fileSize", size);
-                                photo.put("isFavorite", false);
-                                photo.put("isVault", false);
-                                photo.put("isHidden", false);
-                                photo.put("isRaw", false);
-                                photo.put("isHdr", false);
-                                photo.put("isLivePhoto", false);
-                                photo.put("cloudSource", "local");
-                                photo.put("rating", 0);
-
-                                newPhotos.put(photo);
-                            }
-                        } while (cursor.moveToNext());
-                    }
-                }
+                String rootDocId = DocumentsContract.getTreeDocumentId(treeUri);
+                scanDirectoryRecursive(treeUri, rootDocId, newPhotos, isoFormat, 0);
 
                 if (newPhotos.length() > 0) {
                     runOnUiThread(() -> {
@@ -486,8 +439,8 @@ public class MainActivity extends Activity {
                             "    var combined = imported.filter(function(p){ return !idMap.has(p.id); }).concat(existing);" +
                             "    localStorage.setItem('galaxsee_imported_photos', JSON.stringify(combined));" +
                             "    window.dispatchEvent(new CustomEvent('folderPhotosImported', { detail: { photos: imported, total: combined.length } }));" +
+                            "    window.dispatchEvent(new CustomEvent('galaxseePhotosUpdated', { detail: { photos: combined } }));" +
                             "    console.log('Imported ' + imported.length + ' photos from folder.');" +
-                            "    if (window.location) window.location.reload();" +
                             "  } catch(e) {" +
                             "    console.error('Error handling imported folder photos:', e);" +
                             "  }" +
@@ -499,6 +452,73 @@ public class MainActivity extends Activity {
                 Log.e(TAG, "Error scanning document tree: " + treeUri, e);
             }
         }).start();
+    }
+
+    private void scanDirectoryRecursive(Uri treeUri, String parentDocId, JSONArray newPhotos, SimpleDateFormat isoFormat, int depth) {
+        if (depth > 4 || newPhotos.length() >= 500) return;
+        try {
+            Uri childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId);
+            String[] projection = new String[]{
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE,
+                DocumentsContract.Document.COLUMN_SIZE,
+                DocumentsContract.Document.COLUMN_LAST_MODIFIED
+            };
+
+            try (Cursor cursor = getContentResolver().query(childrenUri, projection, null, null, null)) {
+                if (cursor != null && cursor.moveToFirst()) {
+                    int idCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID);
+                    int nameCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME);
+                    int mimeCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE);
+                    int sizeCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_SIZE);
+                    int modCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_LAST_MODIFIED);
+
+                    do {
+                        String docId = cursor.getString(idCol);
+                        String name = cursor.getString(nameCol);
+                        String mime = cursor.getString(mimeCol);
+                        long size = cursor.getLong(sizeCol);
+                        long mod = cursor.getLong(modCol);
+
+                        if (DocumentsContract.Document.MIME_TYPE_DIR.equals(mime)) {
+                            scanDirectoryRecursive(treeUri, docId, newPhotos, isoFormat, depth + 1);
+                        } else if (mime != null && (mime.startsWith("image/") || mime.startsWith("video/"))) {
+                            Uri docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId);
+                            String encoded = Uri.encode(docUri.toString());
+                            boolean isVideo = mime.startsWith("video/");
+                            String dateIso = isoFormat.format(new Date(mod > 0 ? mod : System.currentTimeMillis()));
+
+                            JSONObject photo = new JSONObject();
+                            photo.put("id", "tree-doc-" + Math.abs(docId.hashCode()));
+                            photo.put("title", name != null ? name.replaceFirst("[.][^.]+$", "") : "Imported File");
+                            photo.put("description", name + " (" + (size / 1024) + " KB)");
+                            photo.put("url", "https://" + MEDIA_HOST + "/image/doc_" + encoded);
+                            photo.put("thumbnailUrl", "https://" + MEDIA_HOST + "/thumbnail/doc_" + encoded);
+                            photo.put("width", 1920);
+                            photo.put("height", 1080);
+                            photo.put("aspectRatio", 1.77);
+                            photo.put("date", dateIso);
+                            photo.put("category", isVideo ? "Videos" : "Imported Folder");
+                            photo.put("fileType", mime);
+                            photo.put("fileSize", size);
+                            photo.put("isFavorite", false);
+                            photo.put("isVault", false);
+                            photo.put("isHidden", false);
+                            photo.put("isRaw", false);
+                            photo.put("isHdr", false);
+                            photo.put("isLivePhoto", false);
+                            photo.put("cloudSource", "local");
+                            photo.put("rating", 0);
+
+                            newPhotos.put(photo);
+                        }
+                    } while (cursor.moveToNext() && newPhotos.length() < 500);
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Error reading child document directory: " + parentDocId, e);
+        }
     }
 
     private void syncDeviceMediaToWeb() {
