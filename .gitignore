@@ -1,0 +1,8 @@
+*.bak
+*.idsig
+android_build/bin/
+android_build/gen/
+android_build/compiled_res.zip
+android_build/base_unaligned.apk
+android_build/galaxsee_pro_aligned.apk
+android_build/debug.keystore
