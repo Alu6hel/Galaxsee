@@ -39,13 +39,13 @@ echo "[4/6] Generating classes.dex..."
 cd bin && zip -u ../base_unaligned.apk classes.dex && cd ..
 
 echo "[5/6] Zipalign..."
-"$BUILD_TOOLS_DIR/zipalign" -p 4 base_unaligned.apk galaxsee_pro_aligned.apk
+"$BUILD_TOOLS_DIR/zipalign" -p 4 base_unaligned.apk galaxsee_aligned.apk
 
 echo "[6/6] Signing APK..."
 if [ ! -f debug.keystore ]; then
     keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
 fi
 
-"$BUILD_TOOLS_DIR/apksigner" sign --ks debug.keystore --ks-pass pass:android --out "$ROOT_DIR/galaxsee_pro.apk" galaxsee_pro_aligned.apk
+"$BUILD_TOOLS_DIR/apksigner" sign --ks debug.keystore --ks-pass pass:android --out "$ROOT_DIR/galaxsee.apk" galaxsee_aligned.apk
 
-echo "SUCCESS! Production APK generated at: $ROOT_DIR/galaxsee_pro.apk"
+echo "SUCCESS! Production APK generated at: $ROOT_DIR/galaxsee.apk"
