@@ -1,17 +1,26 @@
 package com.galaxsee.app;
 
 import android.app.Activity;
+import android.content.ClipData;
+import android.content.ClipDescription;
+import android.content.ClipboardManager;
 import android.content.ContentResolver;
 import android.content.ContentUris;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.res.AssetFileDescriptor;
+import android.database.ContentObserver;
 import android.database.Cursor;
+import android.media.ExifInterface;
+import android.widget.Toast;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.ParcelFileDescriptor;
 import android.provider.DocumentsContract;
 import android.provider.MediaStore;
@@ -38,6 +47,7 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.text.SimpleDateFormat;
 import java.util.Date;
@@ -48,7 +58,7 @@ import java.util.TimeZone;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class MainActivity extends Activity {
-    private static final String TAG = "GalaxseePro";
+    private static final String TAG = "Galaxsee";
     private WebView webView;
     private ValueCallback<Uri[]> filePathCallback;
     private static final int FILE_CHOOSER_REQUEST_CODE = 1001;
@@ -60,9 +70,53 @@ public class MainActivity extends Activity {
     private static final Map<String, Uri> sDirectUriMap = new ConcurrentHashMap<>();
     private String openedPhotoJson = null;
 
+    private ContentObserver mediaStoreObserver;
+    private FrameLayout rootLayout;
+    private int safeTopDp = 0, safeBottomDp = 0, safeLeftDp = 0, safeRightDp = 0;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+    private void dispatchSafeInsets() {
+        if (webView != null) {
+            String js = String.format(Locale.US,
+                "if (typeof document !== 'undefined' && document.documentElement) {" +
+                "document.documentElement.style.setProperty('--safe-top', '%dpx');" +
+                "document.documentElement.style.setProperty('--safe-bottom', '%dpx');" +
+                "document.documentElement.style.setProperty('--safe-left', '%dpx');" +
+                "document.documentElement.style.setProperty('--safe-right', '%dpx');" +
+                "}",
+                safeTopDp, safeBottomDp, safeLeftDp, safeRightDp
+            );
+            webView.post(() -> webView.evaluateJavascript(js, null));
+        }
+    }
+    private final Runnable syncDebounceRunnable = () -> {
+        if (hasStoragePermission()) {
+            syncDeviceMediaToWeb();
+        }
+    };
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+
+        // ContentObserver to detect instant photo additions / deletions / modifications by other apps
+        try {
+            mediaStoreObserver = new ContentObserver(mainHandler) {
+                @Override
+                public void onChange(boolean selfChange, Uri uri) {
+                    super.onChange(selfChange, uri);
+                    mainHandler.removeCallbacks(syncDebounceRunnable);
+                    mainHandler.postDelayed(syncDebounceRunnable, 300);
+                }
+            };
+            getContentResolver().registerContentObserver(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                true,
+                mediaStoreObserver
+            );
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to register MediaStore ContentObserver", e);
+        }
 
         // Process incoming intent if opened as default viewer or shared
         handleIncomingIntent(getIntent());
@@ -73,10 +127,49 @@ public class MainActivity extends Activity {
             WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED
         );
 
-        FrameLayout root = new FrameLayout(this);
+        rootLayout = new FrameLayout(this);
+        FrameLayout root = rootLayout;
         root.setBackgroundColor(0xFF070A12);
 
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            getWindow().setDecorFitsSystemWindows(false);
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            getWindow().getDecorView().setSystemUiVisibility(
+                View.SYSTEM_UI_FLAG_LAYOUT_STABLE |
+                View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN |
+                View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+            );
+        }
+
+        root.setOnApplyWindowInsetsListener((v, insets) -> {
+            int topPx = 0, bottomPx = 0, leftPx = 0, rightPx = 0;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                android.graphics.Insets sb = insets.getInsets(
+                    android.view.WindowInsets.Type.systemBars() | android.view.WindowInsets.Type.displayCutout()
+                );
+                topPx = sb.top;
+                bottomPx = sb.bottom;
+                leftPx = sb.left;
+                rightPx = sb.right;
+            } else {
+                topPx = insets.getSystemWindowInsetTop();
+                bottomPx = insets.getSystemWindowInsetBottom();
+                leftPx = insets.getSystemWindowInsetLeft();
+                rightPx = insets.getSystemWindowInsetRight();
+            }
+            float density = getResources().getDisplayMetrics().density;
+            safeTopDp = Math.round(topPx / density);
+            safeBottomDp = Math.round(bottomPx / density);
+            safeLeftDp = Math.round(leftPx / density);
+            safeRightDp = Math.round(rightPx / density);
+
+            dispatchSafeInsets();
+            return insets;
+        });
+
         webView = new WebView(this);
+        webView.setHapticFeedbackEnabled(true);
+        WebView.setWebContentsDebuggingEnabled(true);
         webView.setBackgroundColor(0xFF070A12);
         webView.setOverScrollMode(View.OVER_SCROLL_IF_CONTENT_SCROLLS);
 
@@ -110,6 +203,10 @@ public class MainActivity extends Activity {
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
                 injectNativeBridge();
+                if (rootLayout != null) {
+                    rootLayout.requestApplyInsets();
+                }
+                dispatchSafeInsets();
                 if (hasStoragePermission()) {
                     syncDeviceMediaToWeb();
                 }
@@ -313,6 +410,14 @@ public class MainActivity extends Activity {
 
             // Fallback MIME detection from file extension
             String lowerName = name.toLowerCase();
+            if (lowerName.endsWith(".mp4") || lowerName.endsWith(".mkv") || lowerName.endsWith(".mov") || lowerName.endsWith(".webm") || lowerName.endsWith(".avi") || lowerName.endsWith(".flv") || lowerName.endsWith(".3gp") || lowerName.endsWith(".wmv") || lowerName.endsWith(".m4v")) {
+                // Strictly ignore videos per application policy
+                return null;
+            }
+            if (mime != null && mime.startsWith("video/")) {
+                return null;
+            }
+
             if (mime == null || mime.isEmpty() || "application/octet-stream".equals(mime)) {
                 if (lowerName.endsWith(".png")) mime = "image/png";
                 else if (lowerName.endsWith(".webp")) mime = "image/webp";
@@ -320,7 +425,6 @@ public class MainActivity extends Activity {
                 else if (lowerName.endsWith(".heic") || lowerName.endsWith(".heif")) mime = "image/heic";
                 else if (lowerName.endsWith(".gif")) mime = "image/gif";
                 else if (lowerName.endsWith(".bmp")) mime = "image/bmp";
-                else if (lowerName.endsWith(".mp4") || lowerName.endsWith(".mkv") || lowerName.endsWith(".mov") || lowerName.endsWith(".webm")) mime = "video/mp4";
                 else if (lowerName.endsWith(".dng") || lowerName.endsWith(".raw") || lowerName.endsWith(".cr2") || lowerName.endsWith(".cr3") || lowerName.endsWith(".arw") || lowerName.endsWith(".nef")) mime = "image/x-raw";
                 else mime = "image/jpeg";
             }
@@ -350,7 +454,6 @@ public class MainActivity extends Activity {
             String uriKey = "intent_" + Math.abs(uri.toString().hashCode());
             sDirectUriMap.put(uriKey, uri);
 
-            boolean isVideo = mime.startsWith("video/");
             boolean isRaw = lowerName.endsWith(".dng") || lowerName.endsWith(".raw") || lowerName.endsWith(".cr2") || lowerName.endsWith(".cr3") || lowerName.endsWith(".arw") || lowerName.endsWith(".nef");
 
             // Format friendly file size
@@ -373,7 +476,7 @@ public class MainActivity extends Activity {
             photo.put("height", height);
             photo.put("aspectRatio", aspect);
             photo.put("date", dateIso);
-            photo.put("category", isVideo ? "Videos" : "Photos");
+            photo.put("category", "Photos");
             photo.put("fileType", mime);
             photo.put("fileSize", size > 0 ? size : 2048000);
             photo.put("isFavorite", false);
@@ -389,6 +492,72 @@ public class MainActivity extends Activity {
             exif.put("cameraMake", "Device");
             exif.put("cameraModel", "External File");
             exif.put("iso", 100);
+
+            String folderName = "Pictures";
+            String parentDir = null;
+            String resolvedPath = null;
+            if ("file".equalsIgnoreCase(uri.getScheme())) {
+                resolvedPath = uri.getPath();
+            }
+            if (resolvedPath != null) {
+                File f = new File(resolvedPath);
+                photo.put("filePath", resolvedPath);
+                parentDir = f.getParent();
+                if (f.getParentFile() != null) folderName = f.getParentFile().getName();
+                photo.put("folder", folderName);
+                if (parentDir != null) photo.put("folderPath", parentDir);
+            }
+
+            try {
+                ExifInterface exifReader = null;
+                if (resolvedPath != null) {
+                    exifReader = new ExifInterface(resolvedPath);
+                } else {
+                    try (InputStream is = getContentResolver().openInputStream(uri)) {
+                        if (is != null) exifReader = new ExifInterface(is);
+                    }
+                }
+                if (exifReader != null) {
+                    float[] latLong = new float[2];
+                    if (exifReader.getLatLong(latLong)) {
+                        JSONObject locObj = new JSONObject();
+                        locObj.put("latitude", (double) latLong[0]);
+                        locObj.put("longitude", (double) latLong[1]);
+                        double alt = exifReader.getAltitude(0.0);
+                        if (alt > 0) locObj.put("altitude", Math.round(alt));
+                        locObj.put("city", folderName);
+                        locObj.put("country", "Device Storage");
+                        locObj.put("name", name);
+                        photo.put("location", locObj);
+                    } else {
+                        JSONObject locObj = new JSONObject();
+                        locObj.put("city", folderName);
+                        locObj.put("country", "Local Device");
+                        locObj.put("name", parentDir != null ? parentDir : folderName);
+                        photo.put("location", locObj);
+                    }
+                    String model = exifReader.getAttribute(ExifInterface.TAG_MODEL);
+                    if (model != null && !model.trim().isEmpty()) exif.put("cameraModel", model.trim());
+                    String make = exifReader.getAttribute(ExifInterface.TAG_MAKE);
+                    if (make != null && !make.trim().isEmpty()) exif.put("cameraMake", make.trim());
+                    int iso = exifReader.getAttributeInt(ExifInterface.TAG_ISO_SPEED_RATINGS, 0);
+                    if (iso > 0) exif.put("iso", iso);
+                    String fNumber = exifReader.getAttribute(ExifInterface.TAG_F_NUMBER);
+                    if (fNumber != null && !fNumber.trim().isEmpty()) exif.put("aperture", "f/" + fNumber.trim());
+                    String expTime = exifReader.getAttribute(ExifInterface.TAG_EXPOSURE_TIME);
+                    if (expTime != null && !expTime.trim().isEmpty()) exif.put("shutterSpeed", expTime.trim());
+                    double focalLen = exifReader.getAttributeDouble(ExifInterface.TAG_FOCAL_LENGTH, 0.0);
+                    if (focalLen > 0) exif.put("focalLength", Math.round(focalLen) + "mm");
+                }
+            } catch (Exception ignored) {
+                try {
+                    JSONObject locObj = new JSONObject();
+                    locObj.put("city", folderName);
+                    locObj.put("country", "Local Device");
+                    photo.put("location", locObj);
+                } catch (Exception ignored2) {}
+            }
+
             photo.put("exif", exif);
 
             JSONArray tags = new JSONArray();
@@ -461,6 +630,17 @@ public class MainActivity extends Activity {
             "      if (window.GalaxseeAndroid && typeof window.GalaxseeAndroid.openFolderPicker === 'function') {" +
             "        window.GalaxseeAndroid.openFolderPicker();" +
             "      }" +
+            "    }," +
+            "    performHaptic: function(type) {" +
+            "      try {" +
+            "        if (window.GalaxseeAndroid && typeof window.GalaxseeAndroid.performHaptic === 'function') {" +
+            "          window.GalaxseeAndroid.performHaptic(type || 'light');" +
+            "        } else if (navigator.vibrate) {" +
+            "          if (type === 'reject') navigator.vibrate([25, 30, 25]);" +
+            "          else if (type === 'keep') navigator.vibrate(40);" +
+            "          else navigator.vibrate(15);" +
+            "        }" +
+            "      } catch (e) {}" +
             "    }" +
             "  };" +
             "  console.log('Galaxsee Android Native Bridge Initialized');" +
@@ -501,7 +681,7 @@ public class MainActivity extends Activity {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     try {
                         Uri contentUri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id);
-                        thumb = getContentResolver().loadThumbnail(contentUri, new Size(512, 512), null);
+                        thumb = getContentResolver().loadThumbnail(contentUri, new Size(384, 384), null);
                     } catch (Exception ignored) {}
                 }
                 if (thumb == null) {
@@ -511,11 +691,11 @@ public class MainActivity extends Activity {
                 }
                 if (thumb != null) {
                     ByteArrayOutputStream bos = new ByteArrayOutputStream();
-                    thumb.compress(Bitmap.CompressFormat.JPEG, 85, bos);
+                    thumb.compress(Bitmap.CompressFormat.JPEG, 80, bos);
                     byte[] data = bos.toByteArray();
                     Map<String, String> headers = new HashMap<>();
                     headers.put("Access-Control-Allow-Origin", "*");
-                    headers.put("Cache-Control", "max-age=86400");
+                    headers.put("Cache-Control", "public, max-age=604800");
                     return new WebResourceResponse("image/jpeg", null, 200, "OK", headers, new ByteArrayInputStream(data));
                 }
                 return openImageStream(id);
@@ -611,6 +791,47 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
+        public void refreshGallery() {
+            syncDeviceMediaToWeb();
+        }
+
+        @JavascriptInterface
+        public void syncDevicePhotos() {
+            syncDeviceMediaToWeb();
+        }
+
+        @JavascriptInterface
+        public void performHaptic(String type) {
+            runOnUiThread(() -> {
+                try {
+                    if (webView == null) return;
+                    if ("keep".equalsIgnoreCase(type) || "confirm".equalsIgnoreCase(type)) {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                            webView.performHapticFeedback(android.view.HapticFeedbackConstants.CONFIRM, android.view.HapticFeedbackConstants.FLAG_IGNORE_VIEW_SETTING);
+                        } else {
+                            webView.performHapticFeedback(android.view.HapticFeedbackConstants.VIRTUAL_KEY, android.view.HapticFeedbackConstants.FLAG_IGNORE_VIEW_SETTING);
+                        }
+                    } else if ("reject".equalsIgnoreCase(type)) {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                            webView.performHapticFeedback(android.view.HapticFeedbackConstants.REJECT, android.view.HapticFeedbackConstants.FLAG_IGNORE_VIEW_SETTING);
+                        } else {
+                            webView.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS, android.view.HapticFeedbackConstants.FLAG_IGNORE_VIEW_SETTING);
+                        }
+                    } else {
+                        // "light", "star", "favorite", "click"
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                            webView.performHapticFeedback(android.view.HapticFeedbackConstants.KEYBOARD_TAP, android.view.HapticFeedbackConstants.FLAG_IGNORE_VIEW_SETTING);
+                        } else {
+                            webView.performHapticFeedback(android.view.HapticFeedbackConstants.VIRTUAL_KEY, android.view.HapticFeedbackConstants.FLAG_IGNORE_VIEW_SETTING);
+                        }
+                    }
+                } catch (Exception e) {
+                    Log.w(TAG, "Failed performHaptic: " + type, e);
+                }
+            });
+        }
+
+        @JavascriptInterface
         public String getInitialOpenedPhotoJson() {
             return openedPhotoJson != null ? openedPhotoJson : "";
         }
@@ -677,6 +898,178 @@ public class MainActivity extends Activity {
         public void openFolder() {
             openFolderPicker();
         }
+
+        @JavascriptInterface
+        public boolean copyPhotoToClipboard(String photoData) {
+            if (photoData == null || photoData.trim().isEmpty()) return false;
+            new Thread(() -> {
+                try {
+                    String url = null;
+                    String idStr = null;
+                    String title = "Photo";
+                    String mimeType = "image/jpeg";
+                    long mediaId = -1;
+                    Uri targetUri = null;
+
+                    // 1. Try parsing JSON
+                    if (photoData.trim().startsWith("{")) {
+                        try {
+                            JSONObject json = new JSONObject(photoData);
+                            url = json.optString("url", null);
+                            idStr = json.optString("id", null);
+                            title = json.optString("title", "Photo");
+                            String ft = json.optString("fileType", null);
+                            if (ft != null && !ft.isEmpty()) mimeType = ft;
+                        } catch (Exception ignored) {}
+                    } else {
+                        url = photoData.trim();
+                    }
+
+                    // 2. Extract mediaId or targetUri
+                    if (idStr != null) {
+                        if (idStr.startsWith("android-media-")) {
+                            try { mediaId = Long.parseLong(idStr.substring("android-media-".length())); } catch (Exception ignored) {}
+                        } else if (idStr.startsWith("android-doc-")) {
+                            String key = idStr.substring("android-doc-".length());
+                            targetUri = sDirectUriMap.get(key);
+                        } else {
+                            try { mediaId = Long.parseLong(idStr); } catch (Exception ignored) {}
+                        }
+                    }
+
+                    if (mediaId <= 0 && targetUri == null && url != null) {
+                        if (url.startsWith("content://") || url.startsWith("file://")) {
+                            targetUri = Uri.parse(url);
+                        } else if (url.contains("/image/")) {
+                            String sub = url.substring(url.indexOf("/image/") + "/image/".length());
+                            if (sub.contains("?")) sub = sub.substring(0, sub.indexOf("?"));
+                            if (sub.contains("&")) sub = sub.substring(0, sub.indexOf("&"));
+                            if (sub.contains("#")) sub = sub.substring(0, sub.indexOf("#"));
+                            if (sub.startsWith("doc_")) {
+                                String key = sub.substring(4);
+                                targetUri = sDirectUriMap.get(key);
+                                if (targetUri == null) {
+                                    try { targetUri = Uri.parse(Uri.decode(key)); } catch (Exception ignored) {}
+                                }
+                            } else {
+                                try { mediaId = Long.parseLong(sub); } catch (Exception ignored) {}
+                            }
+                        } else if (url.contains("/thumbnail/")) {
+                            String sub = url.substring(url.indexOf("/thumbnail/") + "/thumbnail/".length());
+                            if (sub.contains("?")) sub = sub.substring(0, sub.indexOf("?"));
+                            if (sub.contains("&")) sub = sub.substring(0, sub.indexOf("&"));
+                            if (sub.contains("#")) sub = sub.substring(0, sub.indexOf("#"));
+                            if (sub.startsWith("doc_")) {
+                                String key = sub.substring(4);
+                                targetUri = sDirectUriMap.get(key);
+                            } else {
+                                try { mediaId = Long.parseLong(sub); } catch (Exception ignored) {}
+                            }
+                        } else if (url.contains("/direct_uri/")) {
+                            String key = url.substring(url.indexOf("/direct_uri/") + "/direct_uri/".length());
+                            targetUri = sDirectUriMap.get(key);
+                            if (targetUri == null) {
+                                try { targetUri = Uri.parse(Uri.decode(key)); } catch (Exception ignored) {}
+                            }
+                        } else if (url.startsWith("android-media-")) {
+                            try { mediaId = Long.parseLong(url.substring("android-media-".length())); } catch (Exception ignored) {}
+                        } else if (sDirectUriMap.containsKey(url)) {
+                            targetUri = sDirectUriMap.get(url);
+                        } else {
+                            try { mediaId = Long.parseLong(url); } catch (Exception ignored) {}
+                        }
+                    }
+
+                    Uri imageContentUri = null;
+                    InputStream inStream = null;
+
+                    if (mediaId > 0) {
+                        imageContentUri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, mediaId);
+                        try {
+                            String t = getContentResolver().getType(imageContentUri);
+                            if (t != null && !t.isEmpty()) mimeType = t;
+                        } catch (Exception ignored) {}
+                        try {
+                            inStream = getContentResolver().openInputStream(imageContentUri);
+                        } catch (Exception e) {
+                            Log.e(TAG, "Error opening MediaStore stream for " + mediaId, e);
+                        }
+                    } else if (targetUri != null) {
+                        imageContentUri = targetUri;
+                        try {
+                            String t = getContentResolver().getType(targetUri);
+                            if (t != null && !t.isEmpty()) mimeType = t;
+                        } catch (Exception ignored) {}
+                        try {
+                            if ("file".equalsIgnoreCase(targetUri.getScheme())) {
+                                inStream = new FileInputStream(new File(targetUri.getPath()));
+                            } else {
+                                inStream = getContentResolver().openInputStream(targetUri);
+                            }
+                        } catch (Exception e) {
+                            Log.e(TAG, "Error opening targetUri stream for " + targetUri, e);
+                        }
+                    }
+
+                    File clipboardDir = new File(getCacheDir(), "clipboard");
+                    if (!clipboardDir.exists()) clipboardDir.mkdirs();
+
+                    String ext = ".jpg";
+                    if (mimeType != null && mimeType.contains("png")) ext = ".png";
+                    else if (mimeType != null && mimeType.contains("webp")) ext = ".webp";
+                    else if (mimeType != null && mimeType.contains("gif")) ext = ".gif";
+
+                    File clipFile = new File(clipboardDir, "photo" + ext);
+                    if (inStream != null) {
+                        try (FileOutputStream fos = new FileOutputStream(clipFile)) {
+                            byte[] buf = new byte[65536];
+                            int len;
+                            while ((len = inStream.read(buf)) != -1) {
+                                fos.write(buf, 0, len);
+                            }
+                            fos.flush();
+                        } catch (Exception e) {
+                            Log.e(TAG, "Error caching clipboard photo file", e);
+                        } finally {
+                            try { inStream.close(); } catch (Exception ignored) {}
+                        }
+                    }
+
+                    Uri providerUri = Uri.parse("content://" + GalaxseeMediaProvider.AUTHORITY + "/photo" + ext);
+                    final Uri finalClipUri = (imageContentUri != null && "content".equals(imageContentUri.getScheme()) && imageContentUri.toString().contains("media/external")) ? imageContentUri : providerUri;
+                    final String finalMime = (mimeType != null && !mimeType.isEmpty()) ? mimeType : "image/jpeg";
+                    final String finalTitle = title;
+
+                    runOnUiThread(() -> {
+                        try {
+                            ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                            if (clipboard == null) return;
+
+                            String[] mimeTypes = new String[]{ finalMime, "image/*" };
+                            ClipDescription description = new ClipDescription(finalTitle, mimeTypes);
+                            ClipData.Item item = new ClipData.Item(finalClipUri);
+                            ClipData clip = new ClipData(description, item);
+
+                            try {
+                                grantUriPermission("android", providerUri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                                if (finalClipUri != providerUri) {
+                                    grantUriPermission("android", finalClipUri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                                }
+                            } catch (Exception ignored) {}
+
+                            clipboard.setPrimaryClip(clip);
+                            Toast.makeText(MainActivity.this, "Physical photo copied to clipboard 📋", Toast.LENGTH_SHORT).show();
+                            Log.d(TAG, "Physical photo copied to clipboard: " + finalClipUri + " (" + finalMime + ")");
+                        } catch (Exception e) {
+                            Log.e(TAG, "Error setting image clipboard clip", e);
+                        }
+                    });
+                } catch (Exception e) {
+                    Log.e(TAG, "copyPhotoToClipboard background error", e);
+                }
+            }).start();
+            return true;
+        }
     }
 
     private String scanMediaStorePhotos() {
@@ -685,12 +1078,10 @@ public class MainActivity extends Activity {
         isoFormat.setTimeZone(TimeZone.getTimeZone("UTC"));
 
         Uri[] uris = new Uri[]{
-            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-            MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI
         };
 
         for (Uri baseUri : uris) {
-            boolean isVideo = baseUri.equals(MediaStore.Video.Media.EXTERNAL_CONTENT_URI);
             String[] projection = new String[]{
                 MediaStore.MediaColumns._ID,
                 MediaStore.MediaColumns.DISPLAY_NAME,
@@ -699,7 +1090,8 @@ public class MainActivity extends Activity {
                 MediaStore.MediaColumns.DATE_ADDED,
                 MediaStore.MediaColumns.DATE_MODIFIED,
                 MediaStore.MediaColumns.WIDTH,
-                MediaStore.MediaColumns.HEIGHT
+                MediaStore.MediaColumns.HEIGHT,
+                MediaStore.MediaColumns.DATA
             };
 
             String sortOrder = MediaStore.MediaColumns.DATE_ADDED + " DESC";
@@ -714,6 +1106,7 @@ public class MainActivity extends Activity {
                     int dateAddedCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATE_ADDED);
                     int widthCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.WIDTH);
                     int heightCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.HEIGHT);
+                    int dataCol = cursor.getColumnIndex(MediaStore.MediaColumns.DATA);
 
                     do {
                         long id = cursor.getLong(idCol);
@@ -724,8 +1117,27 @@ public class MainActivity extends Activity {
                         int width = cursor.getInt(widthCol);
                         int height = cursor.getInt(heightCol);
 
+                        String dataPath = null;
+                        if (dataCol != -1) {
+                            dataPath = cursor.getString(dataCol);
+                            if (dataPath != null && !dataPath.isEmpty()) {
+                                File file = new File(dataPath);
+                                if (!file.exists()) {
+                                    continue;
+                                }
+                            }
+                        }
+
                         if (name == null || name.isEmpty()) name = "Media_" + id;
-                        if (mime == null || mime.isEmpty()) mime = isVideo ? "video/mp4" : "image/jpeg";
+                        String lowerName = name.toLowerCase();
+                        if (lowerName.endsWith(".mp4") || lowerName.endsWith(".mkv") || lowerName.endsWith(".mov") || lowerName.endsWith(".webm") || lowerName.endsWith(".avi") || lowerName.endsWith(".flv") || lowerName.endsWith(".3gp") || lowerName.endsWith(".wmv") || lowerName.endsWith(".m4v")) {
+                            continue;
+                        }
+                        if (mime != null && mime.startsWith("video/")) {
+                            continue;
+                        }
+
+                        if (mime == null || mime.isEmpty()) mime = "image/jpeg";
                         if (width <= 0) width = 1920;
                         if (height <= 0) height = 1080;
 
@@ -742,7 +1154,7 @@ public class MainActivity extends Activity {
                         photo.put("height", height);
                         photo.put("aspectRatio", aspect);
                         photo.put("date", dateIso);
-                        photo.put("category", isVideo ? "Videos" : "Photos");
+                        photo.put("category", "Photos");
                         photo.put("fileType", mime);
                         photo.put("fileSize", size);
                         photo.put("isFavorite", false);
@@ -758,17 +1170,114 @@ public class MainActivity extends Activity {
                         exif.put("cameraMake", "Android");
                         exif.put("cameraModel", "Device Camera");
                         exif.put("iso", 100);
+
+                        String folderName = "Pictures";
+                        String parentDir = null;
+
+                        if (dataPath != null && !dataPath.isEmpty()) {
+                            File file = new File(dataPath);
+                            photo.put("filePath", dataPath);
+                            parentDir = file.getParent();
+                            if (file.getParentFile() != null) {
+                                folderName = file.getParentFile().getName();
+                                if ("0".equals(folderName) || "emulated".equalsIgnoreCase(folderName)) {
+                                    folderName = "Internal Storage";
+                                }
+                            }
+                            photo.put("folder", folderName);
+                            if (parentDir != null) {
+                                photo.put("folderPath", parentDir);
+                            }
+
+                            String lowerPath = dataPath.toLowerCase();
+                            boolean isExifCandidate = lowerPath.endsWith(".jpg") || lowerPath.endsWith(".jpeg") ||
+                                    lowerPath.endsWith(".heic") || lowerPath.endsWith(".dng") ||
+                                    lowerPath.endsWith(".cr2") || lowerPath.endsWith(".arw") ||
+                                    lowerPath.endsWith(".nef") || lowerPath.endsWith(".raw");
+
+                            if (isExifCandidate) {
+                                try {
+                                    ExifInterface exifReader = new ExifInterface(dataPath);
+                                    float[] latLong = new float[2];
+                                    if (exifReader.getLatLong(latLong)) {
+                                        JSONObject locObj = new JSONObject();
+                                        locObj.put("latitude", (double) latLong[0]);
+                                        locObj.put("longitude", (double) latLong[1]);
+                                        double alt = exifReader.getAltitude(0.0);
+                                        if (alt > 0) locObj.put("altitude", Math.round(alt));
+                                        locObj.put("city", folderName);
+                                        locObj.put("country", "Device Storage");
+                                        locObj.put("name", file.getName());
+                                        photo.put("location", locObj);
+                                    } else {
+                                        JSONObject locObj = new JSONObject();
+                                        locObj.put("city", folderName);
+                                        locObj.put("country", "Local Device");
+                                        locObj.put("name", parentDir != null ? parentDir : folderName);
+                                        photo.put("location", locObj);
+                                    }
+
+                                    String model = exifReader.getAttribute(ExifInterface.TAG_MODEL);
+                                if (model != null && !model.trim().isEmpty()) exif.put("cameraModel", model.trim());
+                                String make = exifReader.getAttribute(ExifInterface.TAG_MAKE);
+                                if (make != null && !make.trim().isEmpty()) exif.put("cameraMake", make.trim());
+                                int exifIso = exifReader.getAttributeInt(ExifInterface.TAG_ISO_SPEED_RATINGS, 0);
+                                if (exifIso > 0) exif.put("iso", exifIso);
+                                String fNumber = exifReader.getAttribute(ExifInterface.TAG_F_NUMBER);
+                                if (fNumber != null && !fNumber.trim().isEmpty()) exif.put("aperture", "f/" + fNumber.trim());
+                                String expTime = exifReader.getAttribute(ExifInterface.TAG_EXPOSURE_TIME);
+                                if (expTime != null && !expTime.trim().isEmpty()) {
+                                    try {
+                                        double sec = Double.parseDouble(expTime.trim());
+                                        if (sec < 1.0 && sec > 0) {
+                                            exif.put("shutterSpeed", "1/" + Math.round(1.0 / sec) + "s");
+                                        } else {
+                                            exif.put("shutterSpeed", expTime.trim() + "s");
+                                        }
+                                    } catch (Exception e) {
+                                        exif.put("shutterSpeed", expTime.trim());
+                                    }
+                                }
+                                double focalLen = exifReader.getAttributeDouble(ExifInterface.TAG_FOCAL_LENGTH, 0.0);
+                                if (focalLen > 0) exif.put("focalLength", Math.round(focalLen) + "mm");
+                            } catch (Exception ignored) {
+                                try {
+                                    JSONObject locObj = new JSONObject();
+                                    locObj.put("city", folderName);
+                                    locObj.put("country", "Local Device");
+                                    locObj.put("name", parentDir != null ? parentDir : folderName);
+                                    photo.put("location", locObj);
+                                } catch (Exception ignored2) {}
+                            }
+                        } else {
+                            try {
+                                JSONObject locObj = new JSONObject();
+                                locObj.put("city", folderName);
+                                locObj.put("country", "Local Device");
+                                locObj.put("name", parentDir != null ? parentDir : folderName);
+                                photo.put("location", locObj);
+                            } catch (Exception ignored) {}
+                        }
+                    } else {
+                            try {
+                                JSONObject locObj = new JSONObject();
+                                locObj.put("city", "Pictures");
+                                locObj.put("country", "Local Device");
+                                photo.put("location", locObj);
+                            } catch (Exception ignored) {}
+                        }
+
                         photo.put("exif", exif);
 
                         JSONArray tags = new JSONArray();
                         tags.put("device");
-                        tags.put(isVideo ? "video" : "photo");
+                        tags.put("photo");
                         photo.put("tags", tags);
                         photo.put("people", new JSONArray());
 
                         photosArray.put(photo);
                         count++;
-                    } while (cursor.moveToNext() && count < 350);
+                    } while (cursor.moveToNext() && count < 5000);
                 }
             } catch (Exception e) {
                 Log.e(TAG, "Error querying media uri: " + baseUri, e);
@@ -844,12 +1353,15 @@ public class MainActivity extends Activity {
 
                         if (DocumentsContract.Document.MIME_TYPE_DIR.equals(mime)) {
                             scanDirectoryRecursive(treeUri, docId, newPhotos, isoFormat, depth + 1);
-                        } else if (mime != null && (mime.startsWith("image/") || mime.startsWith("video/"))) {
+                        } else if (mime != null && mime.startsWith("image/") && !mime.startsWith("video/")) {
+                            String lowerName = (name != null ? name.toLowerCase() : "");
+                            if (lowerName.endsWith(".mp4") || lowerName.endsWith(".mkv") || lowerName.endsWith(".mov") || lowerName.endsWith(".webm") || lowerName.endsWith(".avi") || lowerName.endsWith(".flv") || lowerName.endsWith(".3gp") || lowerName.endsWith(".wmv") || lowerName.endsWith(".m4v")) {
+                                continue;
+                            }
                             Uri docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId);
                             String docKey = "tree_" + Math.abs(docUri.toString().hashCode()) + "_" + Math.abs(docId.hashCode());
                             sDirectUriMap.put(docKey, docUri);
 
-                            boolean isVideo = mime.startsWith("video/");
                             String dateIso = isoFormat.format(new Date(mod > 0 ? mod : System.currentTimeMillis()));
 
                             JSONObject photo = new JSONObject();
@@ -862,7 +1374,7 @@ public class MainActivity extends Activity {
                             photo.put("height", 1080);
                             photo.put("aspectRatio", 1.77);
                             photo.put("date", dateIso);
-                            photo.put("category", isVideo ? "Videos" : "Imported Folder");
+                            photo.put("category", "Imported Folder");
                             photo.put("fileType", mime);
                             photo.put("fileSize", size > 0 ? size : 2048000);
                             photo.put("isFavorite", false);
@@ -873,6 +1385,25 @@ public class MainActivity extends Activity {
                             photo.put("isLivePhoto", false);
                             photo.put("cloudSource", "local");
                             photo.put("rating", 0);
+
+                            String folderName = "Folder";
+                            if (parentDocId != null) {
+                                int colon = parentDocId.lastIndexOf(":");
+                                int slash = parentDocId.lastIndexOf("/");
+                                int sep = Math.max(colon, slash);
+                                if (sep != -1 && sep + 1 < parentDocId.length()) {
+                                    folderName = parentDocId.substring(sep + 1);
+                                }
+                            }
+                            photo.put("folder", folderName);
+                            photo.put("filePath", parentDocId + "/" + (name != null ? name : ""));
+                            try {
+                                JSONObject locObj = new JSONObject();
+                                locObj.put("city", folderName);
+                                locObj.put("country", "Imported Folder");
+                                locObj.put("name", name != null ? name : folderName);
+                                photo.put("location", locObj);
+                            } catch (Exception ignored) {}
 
                             newPhotos.put(photo);
                         }
@@ -894,7 +1425,7 @@ public class MainActivity extends Activity {
                         "  var raw = " + escapedJson + ";" +
                         "  try {" +
                         "    var photos = JSON.parse(raw);" +
-                        "    if (Array.isArray(photos) && photos.length > 0) {" +
+                        "    if (Array.isArray(photos)) {" +
                         "      localStorage.setItem('galaxsee_imported_photos', JSON.stringify(photos));" +
                         "      window.dispatchEvent(new CustomEvent('galaxseePhotosUpdated', { detail: { photos: photos } }));" +
                         "      console.log('Successfully synced ' + photos.length + ' device photos to Galaxsee gallery.');" +
@@ -924,8 +1455,6 @@ public class MainActivity extends Activity {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 permissions = new String[]{
                     "android.permission.READ_MEDIA_IMAGES",
-                    "android.permission.READ_MEDIA_VIDEO",
-                    "android.permission.READ_MEDIA_AUDIO",
                     "android.permission.ACCESS_MEDIA_LOCATION",
                     "android.permission.CAMERA"
                 };
@@ -1037,6 +1566,10 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         if (webView != null) webView.onResume();
+        if (hasStoragePermission()) {
+            mainHandler.removeCallbacks(syncDebounceRunnable);
+            mainHandler.postDelayed(syncDebounceRunnable, 100);
+        }
     }
 
     @Override
@@ -1047,6 +1580,12 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        if (mediaStoreObserver != null) {
+            try {
+                getContentResolver().unregisterContentObserver(mediaStoreObserver);
+            } catch (Exception ignored) {}
+        }
+        mainHandler.removeCallbacks(syncDebounceRunnable);
         if (webView != null) webView.destroy();
         super.onDestroy();
     }

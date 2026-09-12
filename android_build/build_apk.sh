@@ -29,7 +29,7 @@ echo "[3/6] Compiling Java source..."
 javac -source 11 -target 11 -cp "$SDK_JAR" \
     -d bin/classes \
     gen/com/galaxsee/app/R.java \
-    src/com/galaxsee/app/MainActivity.java
+    src/com/galaxsee/app/*.java
 
 echo "[4/6] Generating classes.dex..."
 "$BUILD_TOOLS_DIR/d8" bin/classes/com/galaxsee/app/*.class \

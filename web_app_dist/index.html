@@ -26,6 +26,16 @@
               }
             }
           }
+          if (window.GalaxseeAndroid && typeof window.GalaxseeAndroid.getInitialOpenedPhotoJson === 'function') {
+            var openedRaw = window.GalaxseeAndroid.getInitialOpenedPhotoJson();
+            if (openedRaw) {
+              var openedPhoto = JSON.parse(openedRaw);
+              if (openedPhoto && openedPhoto.id) {
+                window.__galaxsee_initial_opened_photo = openedPhoto;
+                console.log('Galaxsee Android: Preloaded opened external photo:', openedPhoto.title);
+              }
+            }
+          }
         } catch (e) {
           console.error('Galaxsee Android init error:', e);
         }
