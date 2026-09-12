@@ -640,6 +640,13 @@ public class MainActivity extends Activity {
             "        window.GalaxseeAndroid.openFolderPicker();" +
             "      }" +
             "    }," +
+            "    setDesktopWallpaper: function(photo) {" +
+            "      if (window.GalaxseeAndroid && typeof window.GalaxseeAndroid.setDesktopWallpaper === 'function') {" +
+            "        var p = (typeof photo === 'object') ? JSON.stringify(photo) : String(photo);" +
+            "        return window.GalaxseeAndroid.setDesktopWallpaper(p);" +
+            "      }" +
+            "      return false;" +
+            "    }," +
             "    performHaptic: function(type) {" +
             "      try {" +
             "        if (window.GalaxseeAndroid && typeof window.GalaxseeAndroid.performHaptic === 'function') {" +
@@ -906,6 +913,136 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void openFolder() {
             openFolderPicker();
+        }
+
+        @JavascriptInterface
+        public boolean setWallpaper(String photoData) {
+            return setDesktopWallpaper(photoData);
+        }
+
+        @JavascriptInterface
+        public boolean setDesktopWallpaper(String photoData) {
+            if (photoData == null || photoData.trim().isEmpty()) return false;
+            new Thread(() -> {
+                InputStream inStream = null;
+                try {
+                    String url = null;
+                    String idStr = null;
+                    String filePath = null;
+                    long mediaId = -1;
+                    Uri targetUri = null;
+
+                    if (photoData.trim().startsWith("{")) {
+                        try {
+                            JSONObject json = new JSONObject(photoData);
+                            url = json.optString("url", null);
+                            idStr = json.optString("id", null);
+                            filePath = json.optString("filePath", null);
+                        } catch (Exception ignored) {}
+                    } else {
+                        url = photoData.trim();
+                    }
+
+                    if (filePath != null && !filePath.isEmpty()) {
+                        File f = new File(filePath);
+                        if (f.exists()) {
+                            inStream = new FileInputStream(f);
+                        }
+                    }
+
+                    if (inStream == null && idStr != null) {
+                        if (idStr.startsWith("android-media-")) {
+                            try { mediaId = Long.parseLong(idStr.substring("android-media-".length())); } catch (Exception ignored) {}
+                        } else if (idStr.startsWith("android-doc-")) {
+                            String key = idStr.substring("android-doc-".length());
+                            targetUri = sDirectUriMap.get(key);
+                        } else {
+                            try { mediaId = Long.parseLong(idStr); } catch (Exception ignored) {}
+                        }
+                    }
+
+                    if (inStream == null && mediaId <= 0 && targetUri == null && url != null) {
+                        if (url.startsWith("content://") || url.startsWith("file://")) {
+                            targetUri = Uri.parse(url);
+                        } else if (url.contains("/image/")) {
+                            String sub = url.substring(url.indexOf("/image/") + "/image/".length());
+                            if (sub.contains("?")) sub = sub.substring(0, sub.indexOf("?"));
+                            if (sub.contains("&")) sub = sub.substring(0, sub.indexOf("&"));
+                            if (sub.contains("#")) sub = sub.substring(0, sub.indexOf("#"));
+                            if (sub.startsWith("doc_")) {
+                                String key = sub.substring(4);
+                                targetUri = sDirectUriMap.get(key);
+                                if (targetUri == null) {
+                                    try { targetUri = Uri.parse(Uri.decode(key)); } catch (Exception ignored) {}
+                                }
+                            } else {
+                                try { mediaId = Long.parseLong(sub); } catch (Exception ignored) {}
+                            }
+                        } else if (url.contains("/thumbnail/")) {
+                            String sub = url.substring(url.indexOf("/thumbnail/") + "/thumbnail/".length());
+                            if (sub.contains("?")) sub = sub.substring(0, sub.indexOf("?"));
+                            if (sub.contains("&")) sub = sub.substring(0, sub.indexOf("&"));
+                            if (sub.contains("#")) sub = sub.substring(0, sub.indexOf("#"));
+                            if (sub.startsWith("doc_")) {
+                                String key = sub.substring(4);
+                                targetUri = sDirectUriMap.get(key);
+                            } else {
+                                try { mediaId = Long.parseLong(sub); } catch (Exception ignored) {}
+                            }
+                        } else if (url.contains("/direct_uri/")) {
+                            String key = url.substring(url.indexOf("/direct_uri/") + "/direct_uri/".length());
+                            targetUri = sDirectUriMap.get(key);
+                            if (targetUri == null) {
+                                try { targetUri = Uri.parse(Uri.decode(key)); } catch (Exception ignored) {}
+                            }
+                        } else if (url.startsWith("android-media-")) {
+                            try { mediaId = Long.parseLong(url.substring("android-media-".length())); } catch (Exception ignored) {}
+                        } else if (sDirectUriMap.containsKey(url)) {
+                            targetUri = sDirectUriMap.get(url);
+                        } else if (url.startsWith("/") && new File(url).exists()) {
+                            targetUri = Uri.fromFile(new File(url));
+                        } else {
+                            try { mediaId = Long.parseLong(url); } catch (Exception ignored) {}
+                        }
+                    }
+
+                    if (inStream == null && mediaId > 0) {
+                        Uri imageContentUri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, mediaId);
+                        inStream = getContentResolver().openInputStream(imageContentUri);
+                    } else if (inStream == null && targetUri != null) {
+                        if ("file".equalsIgnoreCase(targetUri.getScheme())) {
+                            inStream = new FileInputStream(new File(targetUri.getPath()));
+                        } else {
+                            inStream = getContentResolver().openInputStream(targetUri);
+                        }
+                    }
+
+                    if (inStream != null) {
+                        android.app.WallpaperManager wm = android.app.WallpaperManager.getInstance(MainActivity.this);
+                        Bitmap bmp = BitmapFactory.decodeStream(inStream);
+                        if (bmp != null) {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                                wm.setBitmap(bmp, null, true, android.app.WallpaperManager.FLAG_SYSTEM | android.app.WallpaperManager.FLAG_LOCK);
+                            } else {
+                                wm.setBitmap(bmp);
+                            }
+                            runOnUiThread(() -> Toast.makeText(MainActivity.this, "Desktop & Lockscreen wallpaper set! 🖼️", Toast.LENGTH_SHORT).show());
+                        } else {
+                            runOnUiThread(() -> Toast.makeText(MainActivity.this, "Could not decode wallpaper image", Toast.LENGTH_SHORT).show());
+                        }
+                    } else {
+                        runOnUiThread(() -> Toast.makeText(MainActivity.this, "Unable to load photo for wallpaper", Toast.LENGTH_SHORT).show());
+                    }
+                } catch (Exception e) {
+                    Log.e(TAG, "Failed to set wallpaper", e);
+                    runOnUiThread(() -> Toast.makeText(MainActivity.this, "Error setting wallpaper: " + e.getMessage(), Toast.LENGTH_SHORT).show());
+                } finally {
+                    if (inStream != null) {
+                        try { inStream.close(); } catch (Exception ignored) {}
+                    }
+                }
+            }).start();
+            return true;
         }
 
         @JavascriptInterface
