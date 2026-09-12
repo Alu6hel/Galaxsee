@@ -13,19 +13,9 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
     <script>
-      // Android Native Bridge auto-loader
+      // Android Native Bridge initial photo loader
       (function() {
         try {
-          if (window.GalaxseeAndroid && typeof window.GalaxseeAndroid.getDevicePhotosJson === 'function') {
-            var raw = window.GalaxseeAndroid.getDevicePhotosJson();
-            if (raw) {
-              var photos = JSON.parse(raw);
-              if (Array.isArray(photos) && photos.length > 0) {
-                localStorage.setItem('galaxsee_imported_photos', JSON.stringify(photos));
-                console.log('Galaxsee Android: Preloaded ' + photos.length + ' device photos into gallery.');
-              }
-            }
-          }
           if (window.GalaxseeAndroid && typeof window.GalaxseeAndroid.getInitialOpenedPhotoJson === 'function') {
             var openedRaw = window.GalaxseeAndroid.getInitialOpenedPhotoJson();
             if (openedRaw) {

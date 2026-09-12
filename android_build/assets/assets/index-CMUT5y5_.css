@@ -208,6 +208,10 @@ header.h-12 {
     content-visibility: auto;
     contain-intrinsic-size: 0 160px;
 }
+.date-group-container {
+    content-visibility: auto;
+    contain-intrinsic-size: 1000px 320px;
+}
 
 /* Mobile Burst Culling Swipe Badges */
 .cull-swipe-badge-keep {

@@ -106,7 +106,7 @@ public class MainActivity extends Activity {
                 public void onChange(boolean selfChange, Uri uri) {
                     super.onChange(selfChange, uri);
                     mainHandler.removeCallbacks(syncDebounceRunnable);
-                    mainHandler.postDelayed(syncDebounceRunnable, 300);
+                    mainHandler.postDelayed(syncDebounceRunnable, 1000);
                 }
             };
             getContentResolver().registerContentObserver(
@@ -613,6 +613,15 @@ public class MainActivity extends Activity {
             "        return json ? JSON.parse(json) : null;" +
             "      } catch (e) { return null; }" +
             "    }," +
+            "    getPhotoExif: function(idOrPath) {" +
+            "      try {" +
+            "        if (window.GalaxseeAndroid && typeof window.GalaxseeAndroid.getPhotoExif === 'function') {" +
+            "          var raw = window.GalaxseeAndroid.getPhotoExif(idOrPath);" +
+            "          return raw ? JSON.parse(raw) : null;" +
+            "        }" +
+            "      } catch (e) {}" +
+            "      return null;" +
+            "    }," +
             "    openDefaultAppsSettings: function() {" +
             "      if (window.GalaxseeAndroid && typeof window.GalaxseeAndroid.setAsDefaultViewer === 'function') {" +
             "        window.GalaxseeAndroid.setAsDefaultViewer();" +
@@ -1070,6 +1079,86 @@ public class MainActivity extends Activity {
             }).start();
             return true;
         }
+
+        @JavascriptInterface
+        public String getPhotoExif(String photoDataOrId) {
+            if (photoDataOrId == null || photoDataOrId.trim().isEmpty()) return "{}";
+            try {
+                String resolvedPath = null;
+                long mediaId = -1;
+                if (photoDataOrId.startsWith("android-media-")) {
+                    try { mediaId = Long.parseLong(photoDataOrId.substring("android-media-".length())); } catch (Exception ignored) {}
+                } else if (photoDataOrId.startsWith("/") || photoDataOrId.startsWith("file://")) {
+                    resolvedPath = photoDataOrId.startsWith("file://") ? Uri.parse(photoDataOrId).getPath() : photoDataOrId;
+                } else {
+                    try { mediaId = Long.parseLong(photoDataOrId); } catch (Exception ignored) {}
+                }
+
+                if (resolvedPath == null && mediaId > 0) {
+                    Uri contentUri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, mediaId);
+                    String[] proj = new String[]{ MediaStore.MediaColumns.DATA };
+                    try (Cursor c = getContentResolver().query(contentUri, proj, null, null, null)) {
+                        if (c != null && c.moveToFirst()) {
+                            int idx = c.getColumnIndex(MediaStore.MediaColumns.DATA);
+                            if (idx != -1) resolvedPath = c.getString(idx);
+                        }
+                    } catch (Exception ignored) {}
+                }
+
+                JSONObject exif = new JSONObject();
+                exif.put("cameraMake", "Android");
+                exif.put("cameraModel", "Device Camera");
+                exif.put("iso", 100);
+
+                ExifInterface exifReader = null;
+                if (resolvedPath != null && new File(resolvedPath).exists()) {
+                    exifReader = new ExifInterface(resolvedPath);
+                } else if (mediaId > 0) {
+                    Uri contentUri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, mediaId);
+                    try (InputStream is = getContentResolver().openInputStream(contentUri)) {
+                        if (is != null) exifReader = new ExifInterface(is);
+                    } catch (Exception ignored) {}
+                }
+
+                if (exifReader != null) {
+                    String model = exifReader.getAttribute(ExifInterface.TAG_MODEL);
+                    if (model != null && !model.trim().isEmpty()) exif.put("cameraModel", model.trim());
+                    String make = exifReader.getAttribute(ExifInterface.TAG_MAKE);
+                    if (make != null && !make.trim().isEmpty()) exif.put("cameraMake", make.trim());
+                    int exifIso = exifReader.getAttributeInt(ExifInterface.TAG_ISO_SPEED_RATINGS, 0);
+                    if (exifIso > 0) exif.put("iso", exifIso);
+                    String fNumber = exifReader.getAttribute(ExifInterface.TAG_F_NUMBER);
+                    if (fNumber != null && !fNumber.trim().isEmpty()) exif.put("aperture", "f/" + fNumber.trim());
+                    String expTime = exifReader.getAttribute(ExifInterface.TAG_EXPOSURE_TIME);
+                    if (expTime != null && !expTime.trim().isEmpty()) {
+                        try {
+                            double sec = Double.parseDouble(expTime.trim());
+                            if (sec < 1.0 && sec > 0) {
+                                exif.put("shutterSpeed", "1/" + Math.round(1.0 / sec) + "s");
+                            } else {
+                                exif.put("shutterSpeed", expTime.trim() + "s");
+                            }
+                        } catch (Exception e) {
+                            exif.put("shutterSpeed", expTime.trim());
+                        }
+                    }
+                    double focalLen = exifReader.getAttributeDouble(ExifInterface.TAG_FOCAL_LENGTH, 0.0);
+                    if (focalLen > 0) exif.put("focalLength", Math.round(focalLen) + "mm");
+
+                    float[] latLong = new float[2];
+                    if (exifReader.getLatLong(latLong)) {
+                        exif.put("latitude", (double) latLong[0]);
+                        exif.put("longitude", (double) latLong[1]);
+                        double alt = exifReader.getAltitude(0.0);
+                        if (alt > 0) exif.put("altitude", Math.round(alt));
+                    }
+                }
+                return exif.toString();
+            } catch (Exception e) {
+                Log.w(TAG, "Error fetching single photo EXIF", e);
+                return "{}";
+            }
+        }
     }
 
     private String scanMediaStorePhotos() {
@@ -1108,6 +1197,9 @@ public class MainActivity extends Activity {
                     int heightCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.HEIGHT);
                     int dataCol = cursor.getColumnIndex(MediaStore.MediaColumns.DATA);
 
+                    int latCol = cursor.getColumnIndex("latitude");
+                    int lngCol = cursor.getColumnIndex("longitude");
+
                     do {
                         long id = cursor.getLong(idCol);
                         String name = cursor.getString(nameCol);
@@ -1120,12 +1212,6 @@ public class MainActivity extends Activity {
                         String dataPath = null;
                         if (dataCol != -1) {
                             dataPath = cursor.getString(dataCol);
-                            if (dataPath != null && !dataPath.isEmpty()) {
-                                File file = new File(dataPath);
-                                if (!file.exists()) {
-                                    continue;
-                                }
-                            }
                         }
 
                         if (name == null || name.isEmpty()) name = "Media_" + id;
@@ -1175,11 +1261,12 @@ public class MainActivity extends Activity {
                         String parentDir = null;
 
                         if (dataPath != null && !dataPath.isEmpty()) {
-                            File file = new File(dataPath);
                             photo.put("filePath", dataPath);
-                            parentDir = file.getParent();
-                            if (file.getParentFile() != null) {
-                                folderName = file.getParentFile().getName();
+                            int lastSlash = dataPath.lastIndexOf('/');
+                            if (lastSlash > 0) {
+                                parentDir = dataPath.substring(0, lastSlash);
+                                int prevSlash = parentDir.lastIndexOf('/');
+                                folderName = (prevSlash >= 0 && prevSlash + 1 < parentDir.length()) ? parentDir.substring(prevSlash + 1) : parentDir;
                                 if ("0".equals(folderName) || "emulated".equalsIgnoreCase(folderName)) {
                                     folderName = "Internal Storage";
                                 }
@@ -1188,84 +1275,24 @@ public class MainActivity extends Activity {
                             if (parentDir != null) {
                                 photo.put("folderPath", parentDir);
                             }
-
-                            String lowerPath = dataPath.toLowerCase();
-                            boolean isExifCandidate = lowerPath.endsWith(".jpg") || lowerPath.endsWith(".jpeg") ||
-                                    lowerPath.endsWith(".heic") || lowerPath.endsWith(".dng") ||
-                                    lowerPath.endsWith(".cr2") || lowerPath.endsWith(".arw") ||
-                                    lowerPath.endsWith(".nef") || lowerPath.endsWith(".raw");
-
-                            if (isExifCandidate) {
-                                try {
-                                    ExifInterface exifReader = new ExifInterface(dataPath);
-                                    float[] latLong = new float[2];
-                                    if (exifReader.getLatLong(latLong)) {
-                                        JSONObject locObj = new JSONObject();
-                                        locObj.put("latitude", (double) latLong[0]);
-                                        locObj.put("longitude", (double) latLong[1]);
-                                        double alt = exifReader.getAltitude(0.0);
-                                        if (alt > 0) locObj.put("altitude", Math.round(alt));
-                                        locObj.put("city", folderName);
-                                        locObj.put("country", "Device Storage");
-                                        locObj.put("name", file.getName());
-                                        photo.put("location", locObj);
-                                    } else {
-                                        JSONObject locObj = new JSONObject();
-                                        locObj.put("city", folderName);
-                                        locObj.put("country", "Local Device");
-                                        locObj.put("name", parentDir != null ? parentDir : folderName);
-                                        photo.put("location", locObj);
-                                    }
-
-                                    String model = exifReader.getAttribute(ExifInterface.TAG_MODEL);
-                                if (model != null && !model.trim().isEmpty()) exif.put("cameraModel", model.trim());
-                                String make = exifReader.getAttribute(ExifInterface.TAG_MAKE);
-                                if (make != null && !make.trim().isEmpty()) exif.put("cameraMake", make.trim());
-                                int exifIso = exifReader.getAttributeInt(ExifInterface.TAG_ISO_SPEED_RATINGS, 0);
-                                if (exifIso > 0) exif.put("iso", exifIso);
-                                String fNumber = exifReader.getAttribute(ExifInterface.TAG_F_NUMBER);
-                                if (fNumber != null && !fNumber.trim().isEmpty()) exif.put("aperture", "f/" + fNumber.trim());
-                                String expTime = exifReader.getAttribute(ExifInterface.TAG_EXPOSURE_TIME);
-                                if (expTime != null && !expTime.trim().isEmpty()) {
-                                    try {
-                                        double sec = Double.parseDouble(expTime.trim());
-                                        if (sec < 1.0 && sec > 0) {
-                                            exif.put("shutterSpeed", "1/" + Math.round(1.0 / sec) + "s");
-                                        } else {
-                                            exif.put("shutterSpeed", expTime.trim() + "s");
-                                        }
-                                    } catch (Exception e) {
-                                        exif.put("shutterSpeed", expTime.trim());
-                                    }
-                                }
-                                double focalLen = exifReader.getAttributeDouble(ExifInterface.TAG_FOCAL_LENGTH, 0.0);
-                                if (focalLen > 0) exif.put("focalLength", Math.round(focalLen) + "mm");
-                            } catch (Exception ignored) {
-                                try {
-                                    JSONObject locObj = new JSONObject();
-                                    locObj.put("city", folderName);
-                                    locObj.put("country", "Local Device");
-                                    locObj.put("name", parentDir != null ? parentDir : folderName);
-                                    photo.put("location", locObj);
-                                } catch (Exception ignored2) {}
-                            }
                         } else {
-                            try {
-                                JSONObject locObj = new JSONObject();
-                                locObj.put("city", folderName);
-                                locObj.put("country", "Local Device");
-                                locObj.put("name", parentDir != null ? parentDir : folderName);
-                                photo.put("location", locObj);
-                            } catch (Exception ignored) {}
+                            photo.put("folder", "Pictures");
                         }
-                    } else {
-                            try {
-                                JSONObject locObj = new JSONObject();
-                                locObj.put("city", "Pictures");
-                                locObj.put("country", "Local Device");
-                                photo.put("location", locObj);
-                            } catch (Exception ignored) {}
+
+                        JSONObject locObj = new JSONObject();
+                        locObj.put("city", folderName);
+                        locObj.put("country", "Device Storage");
+                        locObj.put("name", name.replaceFirst("[.][^.]+$", ""));
+
+                        if (latCol != -1 && lngCol != -1 && !cursor.isNull(latCol) && !cursor.isNull(lngCol)) {
+                            double lat = cursor.getDouble(latCol);
+                            double lng = cursor.getDouble(lngCol);
+                            if (lat != 0.0 || lng != 0.0) {
+                                locObj.put("latitude", lat);
+                                locObj.put("longitude", lng);
+                            }
                         }
+                        photo.put("location", locObj);
 
                         photo.put("exif", exif);
 
@@ -1426,7 +1453,12 @@ public class MainActivity extends Activity {
                         "  try {" +
                         "    var photos = JSON.parse(raw);" +
                         "    if (Array.isArray(photos)) {" +
-                        "      localStorage.setItem('galaxsee_imported_photos', JSON.stringify(photos));" +
+                        "      try {" +
+                        "        localStorage.setItem('galaxsee_imported_photos', JSON.stringify(photos));" +
+                        "      } catch (eQuota) {" +
+                        "        try { localStorage.setItem('galaxsee_imported_photos', JSON.stringify(photos.slice(0, 1500))); } catch (eQ2) {}" +
+                        "      }" +
+                        "      window.__galaxsee_device_photos = photos;" +
                         "      window.dispatchEvent(new CustomEvent('galaxseePhotosUpdated', { detail: { photos: photos } }));" +
                         "      console.log('Successfully synced ' + photos.length + ' device photos to Galaxsee gallery.');" +
                         "    }" +
