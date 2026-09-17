@@ -1,10 +1,23 @@
 package com.galaxsee.app;
 
 import android.app.Activity;
+import android.content.pm.PackageInfo;
+import android.provider.Settings;
+import android.media.MediaScannerConnection;
+import android.os.Environment;
+import android.util.Base64;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.FileOutputStream;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import android.content.ClipData;
 import android.content.ClipDescription;
 import android.content.ClipboardManager;
 import android.content.ContentResolver;
+import android.content.ContentValues;
 import android.content.ContentUris;
 import android.content.Context;
 import android.content.Intent;
@@ -1325,6 +1338,269 @@ public class MainActivity extends Activity {
                 Log.w(TAG, "Error fetching single photo EXIF", e);
                 return "{}";
             }
+        }
+
+        @JavascriptInterface
+        public String getAppVersionInfo() {
+            try {
+                PackageInfo pInfo = getPackageManager().getPackageInfo(getPackageName(), 0);
+                JSONObject v = new JSONObject();
+                v.put("versionName", pInfo.versionName != null ? pInfo.versionName : "1.0.0");
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    v.put("versionCode", pInfo.getLongVersionCode());
+                } else {
+                    v.put("versionCode", pInfo.versionCode);
+                }
+                v.put("packageName", getPackageName());
+                v.put("isPro", false);
+                return v.toString();
+            } catch (Exception e) {
+                return "{\"versionName\":\"1.0.0\",\"versionCode\":1}";
+            }
+        }
+
+        @JavascriptInterface
+        public boolean saveFileToDevice(String filename, String content, String mimeType) {
+            if (filename == null || filename.trim().isEmpty() || content == null) return false;
+            final String safeName = filename.replaceAll("[^a-zA-Z0-9._-]", "_");
+            final String safeMime = (mimeType != null && !mimeType.trim().isEmpty()) ? mimeType : "application/octet-stream";
+
+            new Thread(() -> {
+                try {
+                    byte[] bytes;
+                    if (content.startsWith("data:") && content.contains(",")) {
+                        String b64 = content.substring(content.indexOf(",") + 1);
+                        bytes = Base64.decode(b64, Base64.DEFAULT);
+                    } else if (safeMime.contains("svg") || safeMime.contains("text") || content.startsWith("<?xml") || content.startsWith("<svg")) {
+                        bytes = content.getBytes(StandardCharsets.UTF_8);
+                    } else {
+                        try {
+                            bytes = Base64.decode(content, Base64.DEFAULT);
+                        } catch (Exception notB64) {
+                            bytes = content.getBytes(StandardCharsets.UTF_8);
+                        }
+                    }
+
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        ContentValues values = new ContentValues();
+                        values.put(MediaStore.Downloads.DISPLAY_NAME, safeName);
+                        values.put(MediaStore.Downloads.MIME_TYPE, safeMime);
+                        values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/Galaxsee");
+                        values.put(MediaStore.Downloads.IS_PENDING, 1);
+
+                        Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+                        if (uri != null) {
+                            try (OutputStream os = getContentResolver().openOutputStream(uri)) {
+                                if (os != null) os.write(bytes);
+                            }
+                            values.clear();
+                            values.put(MediaStore.Downloads.IS_PENDING, 0);
+                            getContentResolver().update(uri, values, null, null);
+                        }
+                    } else {
+                        File downloadDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+                        File targetDir = new File(downloadDir, "Galaxsee");
+                        if (!targetDir.exists()) targetDir.mkdirs();
+                        File targetFile = new File(targetDir, safeName);
+                        try (FileOutputStream fos = new FileOutputStream(targetFile)) {
+                            fos.write(bytes);
+                        }
+                        MediaScannerConnection.scanFile(MainActivity.this, new String[]{targetFile.getAbsolutePath()}, new String[]{safeMime}, null);
+                    }
+
+                    runOnUiThread(() -> {
+                        Toast.makeText(MainActivity.this, "Saved " + safeName + " to Downloads 📁", Toast.LENGTH_LONG).show();
+                        if (webView != null) {
+                            webView.evaluateJavascript("window.dispatchEvent(new CustomEvent('galaxseeFileSaved', { detail: { filename: '" + safeName + "' } }));", null);
+                        }
+                    });
+                } catch (Exception e) {
+                    Log.e(TAG, "saveFileToDevice error", e);
+                    runOnUiThread(() -> Toast.makeText(MainActivity.this, "Failed to save file: " + e.getMessage(), Toast.LENGTH_SHORT).show());
+                }
+            }).start();
+            return true;
+        }
+
+        @JavascriptInterface
+        public void checkForUpdates(String repoOwner, String repoName) {
+            new Thread(() -> {
+                try {
+                    String owner = (repoOwner != null && !repoOwner.trim().isEmpty()) ? repoOwner.trim() : "Alu6hel";
+                    String repo = (repoName != null && !repoName.trim().isEmpty()) ? repoName.trim() : ("Galaxsee");
+                    String apiUrl = "https://api.github.com/repos/" + owner + "/" + repo + "/releases/latest";
+
+                    HttpURLConnection conn = (HttpURLConnection) new URL(apiUrl).openConnection();
+                    conn.setRequestProperty("User-Agent", "Galaxsee-App-Updater");
+                    conn.setRequestProperty("Accept", "application/vnd.github.v3+json");
+                    conn.setConnectTimeout(8000);
+                    conn.setReadTimeout(8000);
+
+                    int respCode = conn.getResponseCode();
+                    if (respCode == 200) {
+                        BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()));
+                        StringBuilder sb = new StringBuilder();
+                        String line;
+                        while ((line = reader.readLine()) != null) sb.append(line);
+                        reader.close();
+
+                        JSONObject release = new JSONObject(sb.toString());
+                        String tagName = release.optString("tag_name", "1.0.0").replace("v", "").trim();
+                        String releaseName = release.optString("name", "Update " + tagName);
+                        String body = release.optString("body", "");
+                        
+                        String apkUrl = "";
+                        long apkSize = 0;
+                        JSONArray assets = release.optJSONArray("assets");
+                        if (assets != null) {
+                            for (int i = 0; i < assets.length(); i++) {
+                                JSONObject asset = assets.getJSONObject(i);
+                                String name = asset.optString("name", "");
+                                if (name.endsWith(".apk")) {
+                                    apkUrl = asset.optString("browser_download_url", "");
+                                    apkSize = asset.optLong("size", 0);
+                                    break;
+                                }
+                            }
+                        }
+
+                        PackageInfo pInfo = getPackageManager().getPackageInfo(getPackageName(), 0);
+                        String currentVersion = pInfo.versionName != null ? pInfo.versionName.replace("v", "").trim() : "1.0.0";
+
+                        boolean isNewer = isVersionNewer(tagName, currentVersion);
+
+                        JSONObject result = new JSONObject();
+                        result.put("currentVersion", currentVersion);
+                        result.put("latestVersion", tagName);
+                        result.put("releaseName", releaseName);
+                        result.put("releaseNotes", body);
+                        result.put("apkUrl", apkUrl);
+                        result.put("apkSize", apkSize);
+                        result.put("isNewer", isNewer);
+
+                        final String resultJson = result.toString();
+                        runOnUiThread(() -> {
+                            if (webView != null) {
+                                webView.evaluateJavascript("window.dispatchEvent(new CustomEvent('galaxseeUpdateChecked', { detail: " + resultJson + " }));", null);
+                            }
+                        });
+                    } else {
+                        runOnUiThread(() -> {
+                            if (webView != null) {
+                                webView.evaluateJavascript("window.dispatchEvent(new CustomEvent('galaxseeUpdateChecked', { detail: { error: 'Release check status: HTTP " + respCode + "', isNewer: false } }));", null);
+                            }
+                        });
+                    }
+                } catch (Exception e) {
+                    Log.e(TAG, "checkForUpdates error", e);
+                    runOnUiThread(() -> {
+                        if (webView != null) {
+                            webView.evaluateJavascript("window.dispatchEvent(new CustomEvent('galaxseeUpdateChecked', { detail: { error: '" + e.getMessage() + "', isNewer: false } }));", null);
+                        }
+                    });
+                }
+            }).start();
+        }
+
+        @JavascriptInterface
+        public void downloadAndInstallUpdate(String apkDownloadUrl) {
+            if (apkDownloadUrl == null || apkDownloadUrl.trim().isEmpty()) return;
+            new Thread(() -> {
+                try {
+                    File updateFile = new File(getCacheDir(), "galaxsee_update.apk");
+                    if (updateFile.exists()) updateFile.delete();
+
+                    HttpURLConnection conn = (HttpURLConnection) new URL(apkDownloadUrl).openConnection();
+                    conn.setRequestProperty("User-Agent", "Galaxsee-App-Updater");
+                    conn.setConnectTimeout(10000);
+                    conn.setReadTimeout(15000);
+                    conn.connect();
+
+                    int fileLength = conn.getContentLength();
+                    try (InputStream input = conn.getInputStream();
+                         FileOutputStream output = new FileOutputStream(updateFile)) {
+                        byte[] data = new byte[8192];
+                        long total = 0;
+                        int count;
+                        long lastReportTime = System.currentTimeMillis();
+
+                        while ((count = input.read(data)) != -1) {
+                            total += count;
+                            output.write(data, 0, count);
+
+                            if (System.currentTimeMillis() - lastReportTime > 200 || total == fileLength) {
+                                lastReportTime = System.currentTimeMillis();
+                                int progress = fileLength > 0 ? (int) (total * 100 / fileLength) : -1;
+                                final long currentTotal = total;
+                                final int currentProgress = progress;
+                                runOnUiThread(() -> {
+                                    if (webView != null) {
+                                        webView.evaluateJavascript("window.dispatchEvent(new CustomEvent('galaxseeUpdateProgress', { detail: { percent: " + currentProgress + ", bytes: " + currentTotal + ", total: " + fileLength + " } }));", null);
+                                    }
+                                });
+                            }
+                        }
+                    }
+
+                    runOnUiThread(() -> {
+                        Toast.makeText(MainActivity.this, "Update downloaded! Launching installer...", Toast.LENGTH_SHORT).show();
+                        installDownloadedApk(updateFile);
+                    });
+                } catch (Exception e) {
+                    Log.e(TAG, "downloadAndInstallUpdate error", e);
+                    runOnUiThread(() -> {
+                        Toast.makeText(MainActivity.this, "Download failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                        if (webView != null) {
+                            webView.evaluateJavascript("window.dispatchEvent(new CustomEvent('galaxseeUpdateError', { detail: { error: '" + e.getMessage() + "' } }));", null);
+                        }
+                    });
+                }
+            }).start();
+        }
+    }
+
+    private static boolean isVersionNewer(String latest, String current) {
+        if (latest == null || current == null) return false;
+        String[] lParts = latest.split("\\.");
+        String[] cParts = current.split("\\.");
+        int len = Math.max(lParts.length, cParts.length);
+        for (int i = 0; i < len; i++) {
+            int lVal = i < lParts.length ? parseVersionSegment(lParts[i]) : 0;
+            int cVal = i < cParts.length ? parseVersionSegment(cParts[i]) : 0;
+            if (lVal > cVal) return true;
+            if (lVal < cVal) return false;
+        }
+        return false;
+    }
+
+    private static int parseVersionSegment(String s) {
+        try {
+            return Integer.parseInt(s.replaceAll("[^0-9]", ""));
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    private void installDownloadedApk(File apkFile) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                if (!getPackageManager().canRequestPackageInstalls()) {
+                    Intent allowIntent = new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES);
+                    allowIntent.setData(Uri.parse("package:" + getPackageName()));
+                    startActivity(allowIntent);
+                    Toast.makeText(this, "Please allow Galaxsee to install updates, then return", Toast.LENGTH_LONG).show();
+                    return;
+                }
+            }
+
+            Uri apkUri = Uri.parse("content://" + GalaxseeFileProvider.AUTHORITY + "/" + apkFile.getName());
+            Intent installIntent = new Intent(Intent.ACTION_VIEW);
+            installIntent.setDataAndType(apkUri, "application/vnd.android.package-archive");
+            installIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(installIntent);
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to launch package installer", e);
+            Toast.makeText(this, "Installation error: " + e.getMessage(), Toast.LENGTH_LONG).show();
         }
     }
 

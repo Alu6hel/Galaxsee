@@ -26,11 +26,16 @@ Built and optimized for **Android Mobile (`.apk`)** and **Modern Web / Offline P
 - **Storage Access Framework (SAF)**: Native recursive directory picker (`ACTION_OPEN_DOCUMENT_TREE`) supporting deep nested folder ingestion up to 4 levels.
 - **Tab History & Hardware Back Button**: Intuitive per-tab back stack navigation.
 
+### 🔄 Universal In-App Update Engine
+- **GitHub Releases Integration**: Built-in update checking against official releases (`/releases/latest`) with changelog viewer.
+- **Seamless Package Installation**: Real-time download progress bar and direct APK installation using Android `PackageInstaller` and `GalaxseeFileProvider`.
+
 ### 🔒 Zero-Knowledge Encrypted Private Vault
 - **AES-256 Encryption**: Protect sensitive photos behind biometric authentication or custom PIN.
 - **Zero Cloud Leak**: 100% local processing; no telemetry, tracking, or cloud upload.
 
 ---
+
 
 ## 📦 Distribution Packages
 

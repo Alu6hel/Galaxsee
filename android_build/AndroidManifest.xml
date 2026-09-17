@@ -18,6 +18,7 @@
     <uses-permission android:name="android.permission.ACCESS_MEDIA_LOCATION" />
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.SET_WALLPAPER" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.touchscreen" android:required="true" />
@@ -101,6 +102,11 @@
             android:name=".GalaxseeMediaProvider"
             android:authorities="com.galaxsee.app.provider"
             android:exported="true"
+            android:grantUriPermissions="true" />
+            <provider
+            android:name=".GalaxseeFileProvider"
+            android:authorities="com.galaxsee.app.fileprovider"
+            android:exported="false"
             android:grantUriPermissions="true" />
     </application>
 </manifest>
