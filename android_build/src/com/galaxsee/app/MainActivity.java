@@ -69,6 +69,10 @@ public class MainActivity extends Activity {
     // In-memory thread-safe URI cache to prevent URL-encoding corruption for external files
     private static final Map<String, Uri> sDirectUriMap = new ConcurrentHashMap<>();
     private String openedPhotoJson = null;
+    private volatile String cachedPhotosJson = null;
+    private volatile long lastScanTimestamp = 0;
+    private volatile boolean isSyncing = false;
+    private volatile long lastSyncCompletedTimestamp = 0;
 
     private ContentObserver mediaStoreObserver;
     private FrameLayout rootLayout;
@@ -105,6 +109,7 @@ public class MainActivity extends Activity {
                 @Override
                 public void onChange(boolean selfChange, Uri uri) {
                     super.onChange(selfChange, uri);
+                    cachedPhotosJson = null;
                     mainHandler.removeCallbacks(syncDebounceRunnable);
                     mainHandler.postDelayed(syncDebounceRunnable, 1000);
                 }
@@ -808,11 +813,13 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public void refreshGallery() {
+            cachedPhotosJson = null;
             syncDeviceMediaToWeb();
         }
 
         @JavascriptInterface
         public void syncDevicePhotos() {
+            cachedPhotosJson = null;
             syncDeviceMediaToWeb();
         }
 
@@ -849,7 +856,14 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public String getInitialOpenedPhotoJson() {
-            return openedPhotoJson != null ? openedPhotoJson : "";
+            String res = openedPhotoJson != null ? openedPhotoJson : "";
+            openedPhotoJson = null;
+            return res;
+        }
+
+        @JavascriptInterface
+        public void clearInitialOpenedPhoto() {
+            openedPhotoJson = null;
         }
 
         @JavascriptInterface
@@ -1057,6 +1071,7 @@ public class MainActivity extends Activity {
                     long mediaId = -1;
                     Uri targetUri = null;
 
+                    String filePath = null;
                     // 1. Try parsing JSON
                     if (photoData.trim().startsWith("{")) {
                         try {
@@ -1064,6 +1079,8 @@ public class MainActivity extends Activity {
                             url = json.optString("url", null);
                             idStr = json.optString("id", null);
                             title = json.optString("title", "Photo");
+                            filePath = json.optString("filePath", null);
+                            if (filePath == null || filePath.isEmpty()) filePath = json.optString("localPath", null);
                             String ft = json.optString("fileType", null);
                             if (ft != null && !ft.isEmpty()) mimeType = ft;
                         } catch (Exception ignored) {}
@@ -1157,6 +1174,24 @@ public class MainActivity extends Activity {
                         }
                     }
 
+                    if (inStream == null && filePath != null && !filePath.isEmpty()) {
+                        File srcF = new File(filePath);
+                        if (srcF.exists()) {
+                            try {
+                                inStream = new FileInputStream(srcF);
+                            } catch (Exception ignored) {}
+                        }
+                    }
+                    if (inStream == null && url != null && url.startsWith("data:image/")) {
+                        try {
+                            int comma = url.indexOf(",");
+                            if (comma > 0) {
+                                byte[] decoded = android.util.Base64.decode(url.substring(comma + 1), android.util.Base64.DEFAULT);
+                                inStream = new java.io.ByteArrayInputStream(decoded);
+                            }
+                        } catch (Exception ignored) {}
+                    }
+
                     File clipboardDir = new File(getCacheDir(), "clipboard");
                     if (!clipboardDir.exists()) clipboardDir.mkdirs();
 
@@ -1182,30 +1217,25 @@ public class MainActivity extends Activity {
                     }
 
                     Uri providerUri = Uri.parse("content://" + GalaxseeMediaProvider.AUTHORITY + "/photo" + ext);
-                    final Uri finalClipUri = (imageContentUri != null && "content".equals(imageContentUri.getScheme()) && imageContentUri.toString().contains("media/external")) ? imageContentUri : providerUri;
+                    final Uri finalClipUri = providerUri;
                     final String finalMime = (mimeType != null && !mimeType.isEmpty()) ? mimeType : "image/jpeg";
-                    final String finalTitle = title;
+                    final String finalTitle = title != null && !title.isEmpty() ? title : "Photo";
 
                     runOnUiThread(() -> {
                         try {
                             ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
                             if (clipboard == null) return;
 
-                            String[] mimeTypes = new String[]{ finalMime, "image/*" };
-                            ClipDescription description = new ClipDescription(finalTitle, mimeTypes);
-                            ClipData.Item item = new ClipData.Item(finalClipUri);
-                            ClipData clip = new ClipData(description, item);
+                            ClipData clip = ClipData.newUri(getContentResolver(), finalTitle, finalClipUri);
+                            clip.addItem(new ClipData.Item(finalTitle));
 
                             try {
-                                grantUriPermission("android", providerUri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
-                                if (finalClipUri != providerUri) {
-                                    grantUriPermission("android", finalClipUri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
-                                }
+                                grantUriPermission("android", finalClipUri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
                             } catch (Exception ignored) {}
 
                             clipboard.setPrimaryClip(clip);
-                            Toast.makeText(MainActivity.this, "Physical photo copied to clipboard 📋", Toast.LENGTH_SHORT).show();
-                            Log.d(TAG, "Physical photo copied to clipboard: " + finalClipUri + " (" + finalMime + ")");
+                            Toast.makeText(MainActivity.this, "Photo copied to clipboard 📋", Toast.LENGTH_SHORT).show();
+                            Log.d(TAG, "Photo successfully copied to clipboard: " + finalClipUri + " (" + finalMime + ")");
                         } catch (Exception e) {
                             Log.e(TAG, "Error setting image clipboard clip", e);
                         }
@@ -1299,6 +1329,11 @@ public class MainActivity extends Activity {
     }
 
     private String scanMediaStorePhotos() {
+        if (cachedPhotosJson != null && (System.currentTimeMillis() - lastScanTimestamp < 15000)) {
+            Log.d(TAG, "Returning cached device media JSON (cache hit)");
+            return cachedPhotosJson;
+        }
+
         JSONArray photosArray = new JSONArray();
         SimpleDateFormat isoFormat = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US);
         isoFormat.setTimeZone(TimeZone.getTimeZone("UTC"));
@@ -1317,7 +1352,8 @@ public class MainActivity extends Activity {
                 MediaStore.MediaColumns.DATE_MODIFIED,
                 MediaStore.MediaColumns.WIDTH,
                 MediaStore.MediaColumns.HEIGHT,
-                MediaStore.MediaColumns.DATA
+                MediaStore.MediaColumns.DATA,
+                "bucket_display_name"
             };
 
             String sortOrder = MediaStore.MediaColumns.DATE_ADDED + " DESC";
@@ -1333,6 +1369,7 @@ public class MainActivity extends Activity {
                     int widthCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.WIDTH);
                     int heightCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.HEIGHT);
                     int dataCol = cursor.getColumnIndex(MediaStore.MediaColumns.DATA);
+                    int bucketCol = cursor.getColumnIndex("bucket_display_name");
 
                     int latCol = cursor.getColumnIndex("latitude");
                     int lngCol = cursor.getColumnIndex("longitude");
@@ -1397,23 +1434,37 @@ public class MainActivity extends Activity {
                         String folderName = "Pictures";
                         String parentDir = null;
 
+                        if (bucketCol != -1 && !cursor.isNull(bucketCol)) {
+                            String b = cursor.getString(bucketCol);
+                            if (b != null && !b.trim().isEmpty()) {
+                                folderName = b.trim();
+                            }
+                        }
+
                         if (dataPath != null && !dataPath.isEmpty()) {
                             photo.put("filePath", dataPath);
+                            photo.put("localPath", dataPath);
                             int lastSlash = dataPath.lastIndexOf('/');
                             if (lastSlash > 0) {
                                 parentDir = dataPath.substring(0, lastSlash);
-                                int prevSlash = parentDir.lastIndexOf('/');
-                                folderName = (prevSlash >= 0 && prevSlash + 1 < parentDir.length()) ? parentDir.substring(prevSlash + 1) : parentDir;
-                                if ("0".equals(folderName) || "emulated".equalsIgnoreCase(folderName)) {
-                                    folderName = "Internal Storage";
+                                if ("Pictures".equalsIgnoreCase(folderName)) {
+                                    int prevSlash = parentDir.lastIndexOf('/');
+                                    String derived = (prevSlash >= 0 && prevSlash + 1 < parentDir.length()) ? parentDir.substring(prevSlash + 1) : parentDir;
+                                    if (!"0".equals(derived) && !"emulated".equalsIgnoreCase(derived)) {
+                                        folderName = derived;
+                                    }
                                 }
+                            }
+                            if ("0".equals(folderName) || "emulated".equalsIgnoreCase(folderName)) {
+                                folderName = "Internal Storage";
                             }
                             photo.put("folder", folderName);
                             if (parentDir != null) {
                                 photo.put("folderPath", parentDir);
                             }
                         } else {
-                            photo.put("folder", "Pictures");
+                            photo.put("folder", folderName);
+                            photo.put("localPath", "");
                         }
 
                         JSONObject locObj = new JSONObject();
@@ -1449,7 +1500,9 @@ public class MainActivity extends Activity {
         }
 
         Log.d(TAG, "Scanned total device media items: " + photosArray.length());
-        return photosArray.toString();
+        cachedPhotosJson = photosArray.toString();
+        lastScanTimestamp = System.currentTimeMillis();
+        return cachedPhotosJson;
     }
 
     private void scanDocumentTree(Uri treeUri) {
@@ -1579,33 +1632,49 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void syncDeviceMediaToWeb() {
+    private synchronized void syncDeviceMediaToWeb() {
+        long now = System.currentTimeMillis();
+        if (isSyncing || (now - lastSyncCompletedTimestamp < 3000 && cachedPhotosJson != null)) {
+            Log.d(TAG, "syncDeviceMediaToWeb skipped (debounce/active)");
+            return;
+        }
+        isSyncing = true;
         new Thread(() -> {
-            String photosJson = scanMediaStorePhotos();
-            runOnUiThread(() -> {
-                if (webView != null) {
-                    String escapedJson = JSONObject.quote(photosJson);
-                    String js = "(function() {" +
-                        "  var raw = " + escapedJson + ";" +
-                        "  try {" +
-                        "    var photos = JSON.parse(raw);" +
-                        "    if (Array.isArray(photos)) {" +
-                        "      try {" +
-                        "        localStorage.setItem('galaxsee_imported_photos', JSON.stringify(photos));" +
-                        "      } catch (eQuota) {" +
-                        "        try { localStorage.setItem('galaxsee_imported_photos', JSON.stringify(photos.slice(0, 1500))); } catch (eQ2) {}" +
-                        "      }" +
-                        "      window.__galaxsee_device_photos = photos;" +
-                        "      window.dispatchEvent(new CustomEvent('galaxseePhotosUpdated', { detail: { photos: photos } }));" +
-                        "      console.log('Successfully synced ' + photos.length + ' device photos to Galaxsee gallery.');" +
-                        "    }" +
-                        "  } catch (e) {" +
-                        "    console.error('Error syncing photos to web:', e);" +
-                        "  }" +
-                        "})();";
-                    webView.evaluateJavascript(js, null);
-                }
-            });
+            try {
+                String photosJson = scanMediaStorePhotos();
+                runOnUiThread(() -> {
+                    try {
+                        if (webView != null) {
+                            String escapedJson = JSONObject.quote(photosJson);
+                            String js = "(function() {" +
+                                "  var raw = " + escapedJson + ";" +
+                                "  try {" +
+                                "    var photos = JSON.parse(raw);" +
+                                "    if (Array.isArray(photos)) {" +
+                                "      try {" +
+                                "        localStorage.setItem('galaxsee_imported_photos', JSON.stringify(photos));" +
+                                "      } catch (eQuota) {" +
+                                "        try { localStorage.setItem('galaxsee_imported_photos', JSON.stringify(photos.slice(0, 1500))); } catch (eQ2) {}" +
+                                "      }" +
+                                "      window.__galaxsee_device_photos = photos;" +
+                                "      window.dispatchEvent(new CustomEvent('galaxseePhotosUpdated', { detail: { photos: photos } }));" +
+                                "      console.log('Successfully synced ' + photos.length + ' device photos to Galaxsee gallery.');" +
+                                "    }" +
+                                "  } catch (e) {" +
+                                "    console.error('Error syncing photos to web:', e);" +
+                                "  }" +
+                                "})();";
+                            webView.evaluateJavascript(js, null);
+                        }
+                    } finally {
+                        lastSyncCompletedTimestamp = System.currentTimeMillis();
+                        isSyncing = false;
+                    }
+                });
+            } catch (Exception e) {
+                isSyncing = false;
+                Log.e(TAG, "Error syncing media: " + e.getMessage());
+            }
         }).start();
     }
 
