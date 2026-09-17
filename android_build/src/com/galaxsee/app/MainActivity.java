@@ -100,7 +100,12 @@ public class MainActivity extends Activity {
                 "document.documentElement.style.setProperty('--safe-bottom', '%dpx');" +
                 "document.documentElement.style.setProperty('--safe-left', '%dpx');" +
                 "document.documentElement.style.setProperty('--safe-right', '%dpx');" +
+                "document.documentElement.style.setProperty('--sat', '%dpx');" +
+                "document.documentElement.style.setProperty('--sab', '%dpx');" +
+                "document.documentElement.style.setProperty('--sal', '%dpx');" +
+                "document.documentElement.style.setProperty('--sar', '%dpx');" +
                 "}",
+                safeTopDp, safeBottomDp, safeLeftDp, safeRightDp,
                 safeTopDp, safeBottomDp, safeLeftDp, safeRightDp
             );
             webView.post(() -> webView.evaluateJavascript(js, null));
@@ -157,6 +162,12 @@ public class MainActivity extends Activity {
                 View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN |
                 View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
             );
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            WindowManager.LayoutParams lp = getWindow().getAttributes();
+            lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            getWindow().setAttributes(lp);
+        }
         }
 
         root.setOnApplyWindowInsetsListener((v, insets) -> {
@@ -296,9 +307,25 @@ public class MainActivity extends Activity {
 
         setContentView(root);
 
+
+
         // Check permissions and load
         checkAndRequestPermissions();
         webView.loadUrl("file:///android_asset/index.html");
+    }
+
+    @Override
+    public void onConfigurationChanged(android.content.res.Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        if (rootLayout != null) {
+            rootLayout.requestApplyInsets();
+        }
+        if (webView != null) {
+            webView.postDelayed(() -> {
+                dispatchSafeInsets();
+                webView.requestLayout();
+            }, 100);
+        }
     }
 
     @Override
